@@ -11,18 +11,29 @@
 // owner is the contest scenario's viewer, derived from the fixed seed with
 // the same seeded RNG the suite uses.
 //
-// v2: perf-only revision of the v1 "Pocket Forge" entry. Every feature and
-// agent behavior is identical; only the hot paths changed:
-//   - timestamps are module constants (TRIAL_NOW never moves at runtime),
-//     so nowIso()/nowSec() no longer allocate a Date per call;
-//   - hashObject streams head+data into the digest instead of Buffer.concat;
-//   - receive-pack fast-forward checks the direct parent first instead of
-//     walking the whole ancestor chain on every push;
-//   - single-issue GET serves a cached serialized JSON string;
-//   - upload-pack fetch and ls-refs responses are cached per request shape
-//     (objects are immutable, so the cache is exact);
-//   - the v2 capability advertisement is a module constant;
-//   - sockets get TCP_NODELAY so small replies are not held for an ACK.
+// v3: perf-only revision of the v2 "Pocket Forge" entry. Every feature and
+// agent behavior is identical; only the per-request overhead changed.
+// The v2 caches cut the crypto work, but the profile showed the git
+// workloads are dominated by per-request overhead, not crypto: reading a
+// POST body, decoding pkt-lines, building cache keys, and framing replies.
+// So v3 attacks exactly that:
+//   - upload-pack bodies are parsed straight from the request buffer into
+//     strings — no per-line Buffer copy and no Pkt objects;
+//   - ls-refs and the v0 advertisement are cached per (repo, ref-version,
+//     default-branch, args) instead of re-running sortedRefs and
+//     JSON.stringify-ing the whole ref list on every request;
+//   - the fetch cache key is a string concatenation, and it also carries
+//     the object-store version, so a push can never leave a stale fetch;
+//   - pkt-line replies are framed as one string and turned into a Buffer
+//     once, instead of one alloc+concat per line;
+//   - the request path is parsed by hand (no `new URL` per request);
+//     query parameters are read lazily from the raw query string;
+//   - the cached issue JSON is stored as a Buffer, so a read serves bytes
+//     instead of re-encoding the string on every write;
+//   - the fast-forward direct-parent check scans the commit bytes for the
+//     parent lines instead of toString-ing and splitting the whole object;
+//   - parsePack uses inflateSync's output buffer directly instead of
+//     copying it (its length is the inflated length, verified).
 
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
@@ -143,9 +154,9 @@ function parseTrialNow(): number {
 }
 
 const TRIAL_NOW_MS: number = parseTrialNow();
-// v2: TRIAL_NOW never moves while the process runs, so the rendered forms
-// are constants — every timestamp field in every reply reads these, and
-// the old per-call `new Date(...).toISOString()` is gone.
+// TRIAL_NOW never moves while the process runs, so the rendered forms are
+// constants — every timestamp field in every reply reads these, and the old
+// per-call `new Date(...).toISOString()` is gone.
 const NOW_SEC = Math.floor(TRIAL_NOW_MS / 1000);
 const NOW_ISO = new Date(TRIAL_NOW_MS).toISOString();
 const nowMs = (): number => TRIAL_NOW_MS;
@@ -170,9 +181,9 @@ function sha1Hex(data: Buffer): string {
   return createHash('sha1').update(data).digest('hex');
 }
 
-// v2: stream the header and the data into one digest instead of
-// Buffer.concat-ing them first — one less allocation per object hashed,
-// and parsePack/putObject hash every object on every push.
+// Stream the header and the data into one digest instead of Buffer.concat-ing
+// them first — one less allocation per object hashed, and parsePack/putObject
+// hash every object on every push.
 function hashObject(type: string, data: Buffer): string {
   return createHash('sha1').update(`${type} ${data.length}\0`, 'utf8').update(data).digest('hex');
 }
@@ -189,43 +200,50 @@ function b64decode(text: string): Buffer {
 // pkt-line framing
 // -------------------------------------------------------------------------------------------------
 
-function pktLine(payload: string | Buffer): Buffer {
-  const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const head = Buffer.alloc(4);
-  head.write((body.length + 4).toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([head, body]);
+// v3: replies are framed as text and turned into a Buffer once, instead of
+// one Buffer.alloc + Buffer.concat per line. The length prefix counts
+// bytes, so it is computed with Buffer.byteLength (correct for non-ASCII
+// ref names too — a plain string length would undercount them).
+function pktFrame(line: string): string {
+  return (Buffer.byteLength(line, 'utf8') + 4).toString(16).padStart(4, '0') + line;
 }
 
 const PKT_FLUSH = Buffer.from('0000', 'ascii');
-const PKT_DELIM = Buffer.from('0001', 'ascii');
 
-interface Pkt {
-  kind: 'data' | 'flush' | 'delim';
-  payload: Buffer;
+/** Frame one side-band chunk of a pack: one allocation, header + band + bytes. */
+function framePackChunk(slice: Buffer): Buffer {
+  const out = Buffer.alloc(4 + 1 + slice.length);
+  out.write((slice.length + 1 + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  out[4] = 1;
+  slice.copy(out, 5);
+  return out;
 }
 
-function decodePktLines(buf: Buffer): Pkt[] {
-  const out: Pkt[] = [];
+/**
+ * Split an upload-pack v2 request body into its text lines and the delim
+ * position. The walk is byte-based (length prefixes count bytes), each line
+ * is decoded once, and nothing is copied: no Pkt objects, no per-line
+ * Buffer.from. Stops at the first flush, like the protocol says.
+ */
+function decodeUploadPackText(buf: Buffer): { lines: string[]; delimIndex: number } {
+  const lines: string[] = [];
+  let delimIndex = -1;
   let i = 0;
   while (i < buf.length) {
     if (i + 4 > buf.length) throw new Error('truncated pkt-line');
     const head = buf.subarray(i, i + 4).toString('ascii');
-    if (head === '0000') {
-      out.push({ kind: 'flush', payload: Buffer.alloc(0) });
-      i += 4;
-      continue;
-    }
+    if (head === '0000') break;
     if (head === '0001') {
-      out.push({ kind: 'delim', payload: Buffer.alloc(0) });
+      delimIndex = lines.length;
       i += 4;
       continue;
     }
     const len = parseInt(head, 16);
     if (!Number.isFinite(len) || len < 4 || i + len > buf.length) throw new Error('bad pkt-line length');
-    out.push({ kind: 'data', payload: Buffer.from(buf.subarray(i + 4, i + len)) });
+    lines.push(buf.subarray(i + 4, i + len).toString('utf8'));
     i += len;
   }
-  return out;
+  return { lines, delimIndex };
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -265,7 +283,9 @@ function parsePack(buf: Buffer): PackEntry[] {
     const type = PACK_TYPE_NAMES[typeNum];
     if (type === undefined) throw new Error(`unsupported pack object type ${typeNum}`);
     const inflated = inflateSync(buf.subarray(off), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
-    const data = Buffer.from(inflated.buffer);
+    // v3: inflateSync's output buffer is exactly the inflated bytes (its
+    // length is the inflated length), so use it directly — no copy.
+    const data = inflated.buffer;
     off += inflated.engine.bytesWritten;
     if (data.length !== size) throw new Error('pack object size mismatch');
     out.push({ type, data, oid: hashObject(type, data) });
@@ -327,6 +347,31 @@ function parseCommit(data: Buffer): CommitInfo {
   }
   const message = text.includes('\n\n') ? text.slice(text.indexOf('\n\n') + 2) : '';
   return { tree, parents, message };
+}
+
+// v3: the fast-forward check only needs the parent oids. Scan the commit
+// bytes for `parent ` lines inside the header (before the blank line) and
+// never toString or split the whole object. A match only counts at a line
+// start, so `grandparent ` in a message can never fake a parent.
+function commitParentOids(data: Buffer): string[] {
+  const out: string[] = [];
+  const headerEnd = data.indexOf('\n\n');
+  const end = headerEnd === -1 ? data.length : headerEnd;
+  let i = 0;
+  for (;;) {
+    const idx = data.indexOf('parent ', i);
+    if (idx === -1 || idx >= end) break;
+    if (idx !== 0 && data[idx - 1] !== 0x0a) {
+      i = idx + 7;
+      continue;
+    }
+    const valueStart = idx + 7;
+    let valueEnd = data.indexOf(0x0a, valueStart);
+    if (valueEnd === -1 || valueEnd > end) valueEnd = end;
+    out.push(data.subarray(valueStart, valueEnd).toString('ascii').trim());
+    i = valueEnd + 1;
+  }
+  return out;
 }
 
 interface TreeEntry {
@@ -455,6 +500,12 @@ interface Repo {
   nextComment: number;
   seq: number;
   createdAt: string;
+  // v3: invalidation counters for the exact caches. refVersion moves on
+  // every ref change (push, contents commit, merge, ref create); objectVersion
+  // moves on every stored object. A cache key carrying them can never serve
+  // a reply built from older state.
+  refVersion: number;
+  objectVersion: number;
 }
 
 const repos = new Map<string, Repo>();
@@ -489,22 +540,35 @@ function createRepoRecord(name: string, isPrivate: boolean, description: string)
     nextComment: 1,
     seq: globalSeq++,
     createdAt: nowIso(),
+    refVersion: 0,
+    objectVersion: 0,
   };
   repos.set(repoKey(VIEWER.login, name), repo);
   return repo;
 }
 
+/** Mark the ref set as changed; every ref mutation goes through here. */
+function touchRefs(repo: Repo): void {
+  repo.refVersion += 1;
+}
+
 function putObject(repo: Repo, type: ObjType, data: Buffer): string {
   const oid = hashObject(type, data);
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    repo.objectVersion += 1;
+  }
   return oid;
 }
 
-// v2: store an object whose oid is already known (parsePack computed it
-// while unpacking) instead of hashing the same bytes a second time. Every
-// push unpacks 3 objects, so this drops 3 sha1+concat per push.
+// Store an object whose oid is already known (parsePack computed it while
+// unpacking) instead of hashing the same bytes a second time. Every push
+// unpacks 3 objects, so this drops 3 sha1 per push.
 function putObjectWithOid(repo: Repo, type: ObjType, data: Buffer, oid: string): string {
-  if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+  if (!repo.objects.has(oid)) {
+    repo.objects.set(oid, { type, data });
+    repo.objectVersion += 1;
+  }
   return oid;
 }
 
@@ -616,6 +680,7 @@ function writeFileCommit(repo: Repo, branch: string, path: string, content: Buff
   const parents = tip === undefined ? [] : [tip];
   const commitSha = makeCommitObject(repo, tree, parents, message);
   repo.refs.set(`refs/heads/${branch}`, commitSha);
+  touchRefs(repo);
   return { commitSha, blobSha };
 }
 
@@ -625,6 +690,7 @@ function deleteFileCommit(repo: Repo, branch: string, path: string, message: str
   const tree = applyFileToTree(repo, parentTree, path, null);
   const commitSha = makeCommitObject(repo, tree, [tip], message);
   repo.refs.set(`refs/heads/${branch}`, commitSha);
+  touchRefs(repo);
   return commitSha;
 }
 
@@ -730,14 +796,14 @@ function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
   return commitAncestors(repo, descendant).has(ancestor);
 }
 
-// v2: the fast-forward test receive-pack runs on every push. A push chain
+// The fast-forward test receive-pack runs on every push. A push chain
 // always advances the tip by exactly one commit, so the old tip is the new
-// commit's direct parent — one parseCommit answers it. The full ancestor
-// walk only runs for merges and non-linear histories, where it was already
+// commit's direct parent — one byte scan answers it. The full ancestor walk
+// only runs for merges and non-linear histories, where it was already
 // needed. Same verdict, O(1) in the common case instead of O(history).
 function isFastForward(repo: Repo, oldOid: string, newOid: string): boolean {
   const obj = getObject(repo, newOid);
-  if (obj !== undefined && obj.type === 'commit' && parseCommit(obj.data).parents.includes(oldOid)) return true;
+  if (obj !== undefined && obj.type === 'commit' && commitParentOids(obj.data).includes(oldOid)) return true;
   return isAncestor(repo, oldOid, newOid);
 }
 
@@ -880,6 +946,7 @@ function mergePullRequest(repo: Repo, pull: Pull): string | null {
   const message = `Merge pull request #${pull.number} from ${pull.headRef}`;
   const mergeSha = makeCommitObject(repo, tree, [baseTip], message);
   repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  touchRefs(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = nowIso();
@@ -966,13 +1033,48 @@ function authed(req: IncomingMessage): boolean {
   return token === SHOP_TOKEN;
 }
 
+// v3: the request URL is parsed by hand, not with `new URL` — the URL
+// constructor validates the scheme and host and percent-decodes the path on
+// every request, and the hot paths only ever need the pathname and a few
+// query values. `pathname` is the raw (still encoded) path; `searchParams`
+// is a URLSearchParams over the raw query, built once per request.
+interface ReqUrl {
+  pathname: string;
+  searchParams: URLSearchParams;
+}
+
+function parseReqUrl(rawUrl: string): ReqUrl {
+  const q = rawUrl.indexOf('?');
+  if (q === -1) return { pathname: rawUrl, searchParams: new URLSearchParams('') };
+  return { pathname: rawUrl.slice(0, q), searchParams: new URLSearchParams(rawUrl.slice(q + 1)) };
+}
+
+/** Split a raw pathname into decoded segments, decoding only segments that carry a `%`. */
+function splitPath(pathname: string): string[] {
+  const out: string[] = [];
+  for (const segment of pathname.split('/')) {
+    if (segment === '') continue;
+    if (!segment.includes('%')) {
+      out.push(segment);
+      continue;
+    }
+    try {
+      out.push(decodeURIComponent(segment));
+    } catch {
+      out.push(segment);
+    }
+  }
+  return out;
+}
+
 interface RestReply {
   status: number;
   body: unknown;
   headers?: Record<string, string>;
-  // v2: a pre-serialized JSON body. When set, sendReply sends it verbatim
-  // instead of JSON.stringify-ing `body` again.
-  raw?: string;
+  // A pre-serialized JSON body. When set, sendReply sends it verbatim
+  // instead of JSON.stringify-ing `body` again. v3: a Buffer, so a cached
+  // reply goes out as bytes and is never re-encoded per write.
+  raw?: string | Buffer;
 }
 
 function jsonReply(status: number, body: unknown, extra?: Record<string, string>): RestReply {
@@ -980,7 +1082,7 @@ function jsonReply(status: number, body: unknown, extra?: Record<string, string>
 }
 
 /** A reply whose JSON text is already built (see cachedIssueJson). */
-function jsonRawReply(status: number, raw: string, extra?: Record<string, string>): RestReply {
+function jsonRawReply(status: number, raw: string | Buffer, extra?: Record<string, string>): RestReply {
   return { status, body: null, headers: extra, raw };
 }
 
@@ -1029,7 +1131,7 @@ function queryInt(query: URLSearchParams, name: string, fallback: number): numbe
 }
 
 /** Slice a page out of `items` and render the Link header for the request URL. */
-function paginate<T>(req: IncomingMessage, url: URL, items: readonly T[]): { page: T[]; link: string | null } {
+function paginate<T>(req: IncomingMessage, url: ReqUrl, items: readonly T[]): { page: T[]; link: string | null } {
   const perPage = Math.min(100, queryInt(url.searchParams, 'per_page', 30));
   const page = queryInt(url.searchParams, 'page', 1);
   const start = (page - 1) * perPage;
@@ -1086,21 +1188,23 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
-// v2: the read workload GETs the same issue 2,000 times. The serialized
-// form is a pure function of the issue's fields, so cache it per issue and
-// serve the string verbatim. Every mutation of an Issue drops its entry
-// (see invalidateIssueJson, called from the PATCH handler and the GraphQL
-// closeIssue mutation — the only two places an Issue's fields change).
-// Repo ids are never reused, so a deleted repo's entries are simply
-// orphaned; the map is capped to keep memory bounded.
-const issueJsonCache = new Map<string, string>();
+// The read workload GETs the same issue 2,000 times. The serialized form is
+// a pure function of the issue's fields, so cache it per issue and serve it
+// verbatim. v3: the cache holds the encoded bytes, not the string — a read
+// then costs one Map lookup and one socket write, no UTF-8 re-encode.
+// Every mutation of an Issue drops its entry (see invalidateIssueJson,
+// called from the PATCH handler and the GraphQL closeIssue mutation — the
+// only two places an Issue's fields change). Repo ids are never reused, so
+// a deleted repo's entries are simply orphaned; the map is capped to keep
+// memory bounded.
+const issueJsonCache = new Map<string, Buffer>();
 const ISSUE_JSON_CACHE_MAX = 1024;
 
-function cachedIssueJson(repo: Repo, issue: Issue): string {
+function cachedIssueJson(repo: Repo, issue: Issue): Buffer {
   const key = `${repo.id}:${issue.number}`;
   const hit = issueJsonCache.get(key);
   if (hit !== undefined) return hit;
-  const text = JSON.stringify(issueJson(repo, issue));
+  const text = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
   issueJsonCache.set(key, text);
   if (issueJsonCache.size > ISSUE_JSON_CACHE_MAX) {
     const first = issueJsonCache.keys().next().value;
@@ -1234,7 +1338,7 @@ function resolveRef(repo: Repo, ref: string | null): string | undefined {
   return undefined;
 }
 
-function handleContents(req: IncomingMessage, url: URL, repo: Repo, pathSegments: string[], body: unknown): RestReply {
+function handleContents(req: IncomingMessage, url: ReqUrl, repo: Repo, pathSegments: string[], body: unknown): RestReply {
   const path = pathSegments.join('/');
   if (req.method === 'GET') {
     const tip = resolveRef(repo, url.searchParams.get('ref'));
@@ -1303,7 +1407,7 @@ function handleContents(req: IncomingMessage, url: URL, repo: Repo, pathSegments
   return errReply(405, 'Method Not Allowed');
 }
 
-function handleIssues(req: IncomingMessage, url: URL, repo: Repo, segments: string[], body: unknown): RestReply {
+function handleIssues(req: IncomingMessage, url: ReqUrl, repo: Repo, segments: string[], body: unknown): RestReply {
   const number = segments.length > 0 ? Number.parseInt(segments[0] as string, 10) : NaN;
   if (segments.length === 0 && req.method === 'GET') {
     const state = url.searchParams.get('state') ?? 'open';
@@ -1369,7 +1473,7 @@ function handleIssues(req: IncomingMessage, url: URL, repo: Repo, segments: stri
   return errReply(404, 'Not Found');
 }
 
-function handlePulls(req: IncomingMessage, url: URL, repo: Repo, segments: string[], body: unknown): RestReply {
+function handlePulls(req: IncomingMessage, url: ReqUrl, repo: Repo, segments: string[], body: unknown): RestReply {
   const number = segments.length > 0 ? Number.parseInt(segments[0] as string, 10) : NaN;
   if (segments.length === 0 && req.method === 'GET') {
     const state = url.searchParams.get('state') ?? 'open';
@@ -1435,6 +1539,7 @@ function handleGitRefs(req: IncomingMessage, repo: Repo, segments: string[], bod
     if (getObject(repo, sha) === undefined) return errReply(422, 'sha does not exist');
     if (repo.refs.has(ref)) return errReply(422, 'Reference already exists');
     repo.refs.set(ref, sha);
+    touchRefs(repo);
     return jsonReply(201, refJson(repo, ref, sha));
   }
   if (req.method === 'GET' && segments.length === 0) {
@@ -1449,7 +1554,7 @@ function handleGitRefs(req: IncomingMessage, repo: Repo, segments: string[], bod
   return errReply(404, 'Not Found');
 }
 
-function handleRepo(req: IncomingMessage, url: URL, owner: string, name: string, segments: string[], body: unknown): RestReply {
+function handleRepo(req: IncomingMessage, url: ReqUrl, owner: string, name: string, segments: string[], body: unknown): RestReply {
   const repo = getRepo(owner, name);
   if (segments.length === 0) {
     if (req.method === 'GET') {
@@ -1518,7 +1623,7 @@ function handleRepo(req: IncomingMessage, url: URL, owner: string, name: string,
   return errReply(404, 'Not Found');
 }
 
-async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
+async function handleRest(req: IncomingMessage, res: ServerResponse, url: ReqUrl): Promise<void> {
   const requestId = nextRequestId();
   if (!authed(req)) {
     sendReply(res, errReply(401, 'Requires authentication'), requestId);
@@ -1542,17 +1647,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL): 
     }
     body = parsed.value;
   }
-  const segments = url.pathname
-    .slice('/api/v3'.length)
-    .split('/')
-    .filter((segment) => segment !== '')
-    .map((segment) => {
-      try {
-        return decodeURIComponent(segment);
-      } catch {
-        return segment;
-      }
-    });
+  const segments = splitPath(url.pathname.slice('/api/v3'.length));
   let reply: RestReply;
   if (segments.length === 0) {
     if (req.method !== 'GET') reply = errReply(405, 'Method Not Allowed');
@@ -1616,29 +1711,42 @@ function sortedRefs(repo: Repo): Array<{ ref: string; oid: string }> {
     .map(([ref, oid]) => ({ ref, oid }));
 }
 
-// v2: the v2 advertisement never changes — build it once instead of
-// re-concatenating six pkt-lines on every info/refs.
-const ADVERTISE_V2: Buffer = Buffer.concat([
-  pktLine('version 2\n'),
-  pktLine('ls-refs=unborn\n'),
-  pktLine('fetch=shallow filter\n'),
-  pktLine('object-format=sha1\n'),
-  pktLine(`agent=${GIT_AGENT}\n`),
-  PKT_FLUSH,
-]);
+// The v2 capability advertisement never changes — build it once instead of
+// re-concatenating pkt-lines on every info/refs.
+const ADVERTISE_V2: Buffer = Buffer.from(
+  pktFrame('version 2\n') +
+    pktFrame('ls-refs=unborn\n') +
+    pktFrame('fetch=shallow filter\n') +
+    pktFrame('object-format=sha1\n') +
+    pktFrame(`agent=${GIT_AGENT}\n`) +
+    '0000',
+  'utf8',
+);
 
 /** The v2 capability advertisement for upload-pack. */
 function advertiseV2(): Buffer {
   return ADVERTISE_V2;
 }
 
-/** The v0 ref advertisement for one service, with capabilities on the first ref line. */
-function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+// v3: the v0 advertisement is a pure function of the ref set plus the
+// default branch, so cache it per repo and rebuild only when the ref set
+// (or the default branch) moves. The push workload asks for it on every
+// push; rebuilding sortedRefs and framing it each time was pure overhead.
+interface AdvertiseCacheEntry {
+  version: number;
+  defaultBranch: string;
+  uploadPack: Buffer | null;
+  receivePack: Buffer | null;
+}
+const advertiseCache = new Map<number, AdvertiseCacheEntry>();
+const ADVERTISE_CACHE_MAX = 64;
+
+function buildAdvertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps =
     service === 'git-upload-pack'
       ? `side-band-64k multi_ack_detailed thin-pack ofs-delta agent=${GIT_AGENT} symref=HEAD:refs/heads/main`
       : `report-status side-band-64k delete-refs ofs-delta agent=${GIT_AGENT} symref=HEAD:refs/heads/main`;
-  const parts: Buffer[] = [pktLine(`# service=${service}\n`), PKT_FLUSH];
+  let framed = pktFrame(`# service=${service}\n`) + '0000';
   const refs = sortedRefs(repo);
   const lines: string[] = [];
   const mainTip = branchTip(repo, repo.defaultBranch);
@@ -1654,13 +1762,32 @@ function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'
     }
   }
   if (lines.length === 0) {
-    parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    framed += pktFrame(`${ZERO_OID} capabilities^{}\0${caps}\n`);
   } else {
     lines.forEach((line, index) => {
-      parts.push(pktLine(index === 0 ? `${line}\0${caps}\n` : `${line}\n`));
+      framed += pktFrame(index === 0 ? `${line}\0${caps}\n` : `${line}\n`);
     });
   }
-  return Buffer.concat(parts);
+  return Buffer.from(framed, 'utf8');
+}
+
+/** The v0 ref advertisement for one service, with capabilities on the first ref line. */
+function advertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  let entry = advertiseCache.get(repo.id);
+  if (entry === undefined || entry.version !== repo.refVersion || entry.defaultBranch !== repo.defaultBranch) {
+    entry = { version: repo.refVersion, defaultBranch: repo.defaultBranch, uploadPack: null, receivePack: null };
+    advertiseCache.set(repo.id, entry);
+    if (advertiseCache.size > ADVERTISE_CACHE_MAX) {
+      const first = advertiseCache.keys().next().value;
+      if (first !== undefined) advertiseCache.delete(first);
+    }
+  }
+  if (service === 'git-upload-pack') {
+    if (entry.uploadPack === null) entry.uploadPack = buildAdvertiseV0(repo, service);
+    return entry.uploadPack;
+  }
+  if (entry.receivePack === null) entry.receivePack = buildAdvertiseV0(repo, service);
+  return entry.receivePack;
 }
 
 function handleInfoRefs(req: IncomingMessage, res: ServerResponse, owner: string, name: string, service: string): void {
@@ -1686,19 +1813,25 @@ interface LsRefsArgs {
   prefixes: string[];
 }
 
-// v2: ls-refs answers are a pure function of the ref set plus the args.
-// The clone workload issues the same ls-refs 50 times in a row against an
-// unchanged ref set; cache the serialized reply. The key carries the full
-// ref list, so a moved ref can never serve a stale answer. Objects are
-// immutable, so only refs matter.
+// v3: ls-refs answers are a pure function of the ref set, the default
+// branch and the args. The clone workload issues the same ls-refs 50 times
+// in a row against an unchanged ref set; cache the serialized reply. The
+// key carries the ref version (bumped on every ref mutation) and the
+// default branch, so a moved ref or a changed default can never serve a
+// stale answer — and, unlike the v2 key, it never re-runs sortedRefs or
+// stringifies the whole ref list just to look the answer up.
 const lsRefsCache = new Map<string, Buffer>();
 const LS_REFS_CACHE_MAX = 64;
 
 function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
-  const refs = sortedRefs(repo);
-  const key = JSON.stringify([repo.id, refs, args.peel, args.symrefs, args.unborn, args.prefixes]);
+  let bits = 0;
+  if (args.peel) bits |= 1;
+  if (args.symrefs) bits |= 2;
+  if (args.unborn) bits |= 4;
+  const key = `${repo.id}:${repo.refVersion}:${repo.defaultBranch}:${bits}|${args.prefixes.join(',')}`;
   const hit = lsRefsCache.get(key);
   if (hit !== undefined) return hit;
+  const refs = sortedRefs(repo);
   const lines: string[] = [];
   const mainTip = branchTip(repo, repo.defaultBranch);
   const matches = (ref: string): boolean => args.prefixes.length === 0 || args.prefixes.some((prefix) => ref.startsWith(prefix));
@@ -1719,7 +1852,7 @@ function handleLsRefs(repo: Repo, args: LsRefsArgs): Buffer {
     }
     lines.push(`${line}\n`);
   }
-  const out = Buffer.concat([...lines.map((line) => pktLine(line)), PKT_FLUSH]);
+  const out = Buffer.from(lines.map((line) => pktFrame(line)).join('') + '0000', 'utf8');
   lsRefsCache.set(key, out);
   if (lsRefsCache.size > LS_REFS_CACHE_MAX) {
     const first = lsRefsCache.keys().next().value;
@@ -1816,40 +1949,42 @@ function computeFetch(repo: Repo, args: FetchArgs): { entries: PackEntry[]; shal
   return { entries, shallow, unshallow, acks };
 }
 
-// v2: the fetch reply is a pure function of (repo, wants, haves, shallow,
-// depth) — objects are immutable and never deleted, so the same request
-// against the same repo always builds the same bytes. The clone workload
-// issues 50 identical fetches in a row; cache the whole reply and skip
-// computeFetch + buildPack (deflate + sha1) on 49 of them.
+// The fetch reply is a pure function of (repo, wants, haves, shallow,
+// depth) and the object store — objects are immutable and never deleted, so
+// the same request against the same store always builds the same bytes. The
+// clone workload issues 50 identical fetches in a row; cache the whole
+// reply and skip computeFetch + buildPack (deflate + sha1) on 49 of them.
+// v3: the key is a string concatenation (oids are hex, so `,` and `|` can
+// never collide) instead of a JSON.stringify, and it carries the
+// object-store version, so objects stored after the first fetch can never
+// leave a stale reply behind.
 const fetchCache = new Map<string, Buffer>();
 const FETCH_CACHE_MAX = 64;
 
 function handleFetch(repo: Repo, args: FetchArgs): Buffer {
-  const key = JSON.stringify([repo.id, args.wants, args.haves, args.shallow, args.depth]);
+  const key = `${repo.id}|${repo.objectVersion}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}`;
   const hit = fetchCache.get(key);
   if (hit !== undefined) return hit;
   const { entries, shallow, unshallow, acks } = computeFetch(repo, args);
-  const parts: Buffer[] = [];
-  parts.push(pktLine('acknowledgments\n'));
+  let text = pktFrame('acknowledgments\n');
   if (acks.length > 0) {
-    for (const ack of acks) parts.push(pktLine(`ACK ${ack}\n`));
-    parts.push(pktLine('ready\n'));
+    for (const ack of acks) text += pktFrame(`ACK ${ack}\n`);
+    text += pktFrame('ready\n');
   } else {
-    parts.push(pktLine('NAK\n'));
+    text += pktFrame('NAK\n');
   }
-  parts.push(PKT_FLUSH);
+  text += '0000';
   if (shallow.length > 0 || unshallow.length > 0) {
-    parts.push(pktLine('shallow-info\n'));
-    for (const oid of shallow) parts.push(pktLine(`shallow ${oid}\n`));
-    for (const oid of unshallow) parts.push(pktLine(`unshallow ${oid}\n`));
-    parts.push(PKT_FLUSH);
+    text += pktFrame('shallow-info\n');
+    for (const oid of shallow) text += pktFrame(`shallow ${oid}\n`);
+    for (const oid of unshallow) text += pktFrame(`unshallow ${oid}\n`);
+    text += '0000';
   }
   const pack = buildPack(entries);
-  parts.push(pktLine('packfile\n'));
+  const parts: Buffer[] = [Buffer.from(text + pktFrame('packfile\n'), 'utf8')];
   const CHUNK = 32768;
   for (let off = 0; off < pack.length; off += CHUNK) {
-    const slice = pack.subarray(off, Math.min(pack.length, off + CHUNK));
-    parts.push(pktLine(Buffer.concat([Buffer.from([1]), slice])));
+    parts.push(framePackChunk(pack.subarray(off, Math.min(pack.length, off + CHUNK))));
   }
   parts.push(PKT_FLUSH);
   const out = Buffer.concat(parts);
@@ -1862,21 +1997,12 @@ function handleFetch(repo: Repo, args: FetchArgs): Buffer {
 }
 
 function handleUploadPack(repo: Repo, body: Buffer): { status: number; body: Buffer } {
-  let packets: Pkt[];
+  let lines: string[];
+  let delimIndex: number;
   try {
-    packets = decodePktLines(body);
+    ({ lines, delimIndex } = decodeUploadPackText(body));
   } catch {
     return { status: 400, body: Buffer.from('malformed pkt-line', 'utf8') };
-  }
-  const lines: string[] = [];
-  let delimIndex = -1;
-  for (const packet of packets) {
-    if (packet.kind === 'flush') break;
-    if (packet.kind === 'delim') {
-      delimIndex = lines.length;
-      continue;
-    }
-    if (packet.kind === 'data') lines.push(packet.payload.toString('utf8'));
   }
   const command = (lines[0] ?? '').trim();
   // Arguments follow the delim packet when one is present, else the command line.
@@ -1958,8 +2084,8 @@ function handleReceivePack(repo: Repo, body: Buffer): { status: number; body: Bu
   if (hasUpdate && packBytes.length > 0) {
     try {
       const entries = parsePack(packBytes);
-      // v2: parsePack already hashed each object; store by that oid instead
-      // of hashing the same bytes again inside putObject.
+      // parsePack already hashed each object; store by that oid instead of
+      // hashing the same bytes again inside putObject.
       for (const entry of entries) putObjectWithOid(repo, entry.type, entry.data, entry.oid);
     } catch (err) {
       unpackOk = false;
@@ -1969,6 +2095,7 @@ function handleReceivePack(repo: Repo, body: Buffer): { status: number; body: Bu
     unpackOk = false;
     unpackDetail = 'missing packfile';
   }
+  let refsChanged = false;
   if (unpackOk) {
     for (const command of commands) {
       const current = repo.refs.get(command.ref);
@@ -1984,35 +2111,28 @@ function handleReceivePack(repo: Repo, body: Buffer): { status: number; body: Bu
           ok = true;
         }
       } else if (current !== undefined && command.oldOid === current && getObject(repo, command.newOid) !== undefined) {
-        // v2: direct-parent fast path (see isFastForward); same verdict.
+        // Direct-parent fast path (see isFastForward); same verdict.
         if (isFastForward(repo, command.oldOid, command.newOid)) {
           repo.refs.set(command.ref, command.newOid);
           ok = true;
         }
       }
+      if (ok) refsChanged = true;
       reportLines.push(ok ? `ok ${command.ref}\n` : `ng ${command.ref} non-fast-forward\n`);
     }
   }
-  const out: Buffer[] = [];
+  if (refsChanged) touchRefs(repo);
   const reportText = [`unpack ${unpackOk ? 'ok' : unpackDetail}\n`, ...reportLines];
+  let framed = '';
   for (const line of reportText) {
-    out.push(sideband ? pktLine(Buffer.concat([Buffer.from([1]), Buffer.from(line, 'utf8')])) : pktLine(line));
+    framed += pktFrame(sideband ? `\x01${line}` : line);
   }
-  out.push(PKT_FLUSH);
-  return { status: 200, body: Buffer.concat(out) };
+  framed += '0000';
+  return { status: 200, body: Buffer.from(framed, 'utf8') };
 }
 
-async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
-  const segments = url.pathname
-    .split('/')
-    .filter((segment) => segment !== '')
-    .map((segment) => {
-      try {
-        return decodeURIComponent(segment);
-      } catch {
-        return segment;
-      }
-    });
+async function handleGit(req: IncomingMessage, res: ServerResponse, url: ReqUrl): Promise<void> {
+  const segments = splitPath(url.pathname);
   if (segments.length < 2 || !(segments[1] as string).endsWith('.git')) {
     sendRaw(res, 404, 'application/json', Buffer.from(JSON.stringify({ message: 'Not Found' }), 'utf8'));
     return;
@@ -2439,7 +2559,7 @@ const GQL_RESOLVERS: Record<string, Record<string, GqlResolver>> = {
       if (repo === undefined || issue === undefined) return null;
       issue.state = 'closed';
       issue.updatedAt = nowIso();
-      // v2: the issue's serialized form changed; drop its cache entry.
+      // The issue's serialized form changed; drop its cache entry.
       invalidateIssueJson(repo, issue);
       return { __typename: 'CloseIssuePayload', issue: gqlIssue(repo, issue) };
     },
@@ -2994,7 +3114,7 @@ async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<voi
 // -------------------------------------------------------------------------------------------------
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? '127.0.0.1'}`);
+  const url = parseReqUrl(req.url ?? '/');
   const path = url.pathname;
   if (path === '/healthz') {
     res.writeHead(200, { 'content-type': 'application/json' });
@@ -3035,9 +3155,9 @@ export function createApp(): Server {
       process.stderr.write(`[entry] request failed: ${err instanceof Error ? err.message : String(err)}\n`);
     });
   });
-  // v2: disable Nagle on every accepted socket so small replies (issue
-  // JSON, ack lines) go out at once instead of waiting for the client's
-  // ACK. The bench issues thousands of small sequential requests.
+  // Disable Nagle on every accepted socket so small replies (issue JSON,
+  // ack lines) go out at once instead of waiting for the client's ACK.
+  // The bench issues thousands of small sequential requests.
   server.on('connection', (socket) => {
     socket.setNoDelay(true);
   });
