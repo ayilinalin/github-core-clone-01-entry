@@ -282,7 +282,7 @@ function parsePack(buf: Buffer): PackEntry[] {
     }
     const type = PACK_TYPE_NAMES[typeNum];
     if (type === undefined) throw new Error(`unsupported pack object type ${typeNum}`);
-    const inflated = inflateSync(buf.subarray(off), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    const inflated = inflateSync(buf.subarray(off), { info: true, maxOutputLength: 64 * 1024 * 1024 }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
     // v3: inflateSync's output buffer is exactly the inflated bytes (its
     // length is the inflated length), so use it directly — no copy.
     const data = inflated.buffer;
@@ -1768,6 +1768,9 @@ function buildAdvertiseV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-
       framed += pktFrame(index === 0 ? `${line}\0${caps}\n` : `${line}\n`);
     });
   }
+  // The advertisement ends with a flush: without it real git dies with
+  // "the remote end hung up upon initial contact" reading the refs.
+  framed += '0000';
   return Buffer.from(framed, 'utf8');
 }
 
@@ -1866,6 +1869,7 @@ interface FetchArgs {
   haves: string[];
   shallow: string[];
   depth: number | null;
+  done: boolean;
 }
 
 /**
@@ -1962,18 +1966,26 @@ const fetchCache = new Map<string, Buffer>();
 const FETCH_CACHE_MAX = 64;
 
 function handleFetch(repo: Repo, args: FetchArgs): Buffer {
-  const key = `${repo.id}|${repo.objectVersion}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}`;
+  const key = `${repo.id}|${repo.objectVersion}|${args.wants.join(',')}|${args.haves.join(',')}|${args.shallow.join(',')}|${args.depth ?? ''}|${args.done ? '1' : '0'}`;
   const hit = fetchCache.get(key);
   if (hit !== undefined) return hit;
   const { entries, shallow, unshallow, acks } = computeFetch(repo, args);
-  let text = pktFrame('acknowledgments\n');
-  if (acks.length > 0) {
-    for (const ack of acks) text += pktFrame(`ACK ${ack}\n`);
-    text += pktFrame('ready\n');
-  } else {
-    text += pktFrame('NAK\n');
+  // Protocol v2: when the client sent `done` it expects the packfile
+  // section next, so no acknowledgments section is sent at all (real git
+  // dies with "expected 'packfile', received 'acknowledgments'" otherwise).
+  // Without `done`, the acks section is emitted only when the client sent
+  // haves, and is separated from what follows by a delim packet (0001).
+  let text = '';
+  if (!args.done && args.haves.length > 0) {
+    text += pktFrame('acknowledgments\n');
+    if (acks.length > 0) {
+      for (const ack of acks) text += pktFrame(`ACK ${ack}\n`);
+      text += pktFrame('ready\n');
+    } else {
+      text += pktFrame('NAK\n');
+    }
+    text += '0001';
   }
-  text += '0000';
   if (shallow.length > 0 || unshallow.length > 0) {
     text += pktFrame('shallow-info\n');
     for (const oid of shallow) text += pktFrame(`shallow ${oid}\n`);
@@ -1996,6 +2008,73 @@ function handleFetch(repo: Repo, args: FetchArgs): Buffer {
   return out;
 }
 
+/**
+ * Protocol v0 fetch (smart-HTTP POST to git-upload-pack). The request body
+ * is pkt-lines — `want <oid>` (the first carries capabilities
+ * space-separated after the oid, e.g. side-band-64k), `have <oid>`,
+ * `shallow <oid>`, `done` — terminated by a flush, with an optional
+ * second flush-separated section (shallow lines). The response is NAK (or
+ * ACK lines) as plain pkt-lines, then the pack — side-band band-1 chunks
+ * when negotiated, raw pack bytes otherwise — then a flush. A v0 fetch used to return HTTP 400 here
+ * ("unknown upload-pack command") because only v2 `command=` lines were
+ * recognized.
+ */
+function handleFetchV0(repo: Repo, body: Buffer): { status: number; body: Buffer } {
+  const wants: string[] = [];
+  const haves: string[] = [];
+  const shallow: string[] = [];
+  let sideband = false;
+  let offset = 0;
+  while (offset < body.length) {
+    if (offset + 4 > body.length) return { status: 400, body: Buffer.from('truncated pkt-line', 'utf8') };
+    const head = body.subarray(offset, offset + 4).toString('ascii');
+    if (head === '0000' || head === '0001') {
+      offset += 4;
+      continue;
+    }
+    const len = parseInt(head, 16);
+    if (!Number.isFinite(len) || len < 4 || offset + len > body.length) return { status: 400, body: Buffer.from('bad pkt-line length', 'utf8') };
+    const t = body.subarray(offset + 4, offset + len).toString('utf8').trim();
+    // Capabilities ride on the first want line, space-separated after the
+    // oid (`want <oid> side-band-64k ...`) — NOT NUL-separated (the NUL
+    // form is for advertisement ref lines). The oid is hex, so a plain
+    // substring check on the whole line is exact.
+    if (t.includes('side-band-64k')) sideband = true;
+    // The oid is the first token after `want `; the rest of the line is
+    // the capability list (space-separated). Taking the whole remainder
+    // would make getObject miss every want and ship an empty pack.
+    if (t.startsWith('want ')) wants.push((t.slice(5).split(/[\s\0]/)[0] as string).trim());
+    else if (t.startsWith('have ')) haves.push(t.slice(5).trim());
+    else if (t.startsWith('shallow ')) shallow.push(t.slice(8).trim());
+    // `done` and anything else: negotiation is over by the time we reply.
+    offset += len;
+  }
+  if (wants.length === 0) return { status: 400, body: Buffer.from('unknown upload-pack command', 'utf8') };
+  // A v0 fetch is always done negotiating: the client sent `done` (or the
+  // request ended) and expects the pack next. computeFetch ignores `done`,
+  // but set it for correctness.
+  const args: FetchArgs = { wants, haves, shallow, depth: null, done: true };
+  const { entries, acks } = computeFetch(repo, args);
+  let out = '';
+  if (acks.length > 0) {
+    for (const ack of acks) out += pktFrame(`ACK ${ack}\n`);
+  } else {
+    out += pktFrame('NAK\n');
+  }
+  const pack = buildPack(entries);
+  const parts: Buffer[] = [Buffer.from(out, 'utf8')];
+  if (sideband) {
+    const CHUNK = 32768;
+    for (let off = 0; off < pack.length; off += CHUNK) {
+      parts.push(framePackChunk(pack.subarray(off, Math.min(pack.length, off + CHUNK))));
+    }
+  } else {
+    parts.push(pack);
+  }
+  parts.push(PKT_FLUSH);
+  return { status: 200, body: Buffer.concat(parts) };
+}
+
 function handleUploadPack(repo: Repo, body: Buffer): { status: number; body: Buffer } {
   let lines: string[];
   let delimIndex: number;
@@ -2007,6 +2086,11 @@ function handleUploadPack(repo: Repo, body: Buffer): { status: number; body: Buf
   const command = (lines[0] ?? '').trim();
   // Arguments follow the delim packet when one is present, else the command line.
   const argsAfter = delimIndex >= 0 ? lines.slice(delimIndex) : lines.slice(1);
+  // Protocol v0 fetch: the request starts with a bare `want` line (no
+  // `command=`), so it is not a v2 command at all. Dispatch it to the v0
+  // handler, which parses the raw body itself — the request can carry a
+  // second flush-separated section (shallow lines after the first flush).
+  if (command.startsWith('want ')) return handleFetchV0(repo, body);
   if (command === 'command=ls-refs') {
     const args: LsRefsArgs = { peel: false, symrefs: false, unborn: false, prefixes: [] };
     for (const line of argsAfter) {
@@ -2019,12 +2103,13 @@ function handleUploadPack(repo: Repo, body: Buffer): { status: number; body: Buf
     return { status: 200, body: handleLsRefs(repo, args) };
   }
   if (command === 'command=fetch') {
-    const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null };
+    const args: FetchArgs = { wants: [], haves: [], shallow: [], depth: null, done: false };
     for (const line of argsAfter) {
       const text = line.trim();
       if (text.startsWith('want ')) args.wants.push(text.slice(5));
       else if (text.startsWith('have ')) args.haves.push(text.slice(5));
       else if (text.startsWith('shallow ')) args.shallow.push(text.slice(8));
+      else if (text === 'done') args.done = true;
       else if (text.startsWith('deepen ')) {
         const n = Number.parseInt(text.slice(7), 10);
         if (Number.isFinite(n) && n > 0) args.depth = n;
@@ -2123,12 +2208,20 @@ function handleReceivePack(repo: Repo, body: Buffer): { status: number; body: Bu
   }
   if (refsChanged) touchRefs(repo);
   const reportText = [`unpack ${unpackOk ? 'ok' : unpackDetail}\n`, ...reportLines];
-  let framed = '';
-  for (const line of reportText) {
-    framed += pktFrame(sideband ? `\x01${line}` : line);
+  // The report is a pkt-framed stream (each line framed, then a flush).
+  // Without side-band it is sent as-is; with side-band the WHOLE stream is
+  // the payload of band-1 packets — a band byte inside each pkt-line is
+  // parsed by real git as a line length ("bad line length character: unpa").
+  const stream = reportText.map((line) => pktFrame(line)).join('') + '0000';
+  if (!sideband) return { status: 200, body: Buffer.from(stream, 'utf8') };
+  const streamBuf = Buffer.from(stream, 'utf8');
+  const parts: Buffer[] = [];
+  const MAX_BAND_PAYLOAD = 65520;
+  for (let off = 0; off < streamBuf.length; off += MAX_BAND_PAYLOAD) {
+    parts.push(framePackChunk(streamBuf.subarray(off, Math.min(streamBuf.length, off + MAX_BAND_PAYLOAD))));
   }
-  framed += '0000';
-  return { status: 200, body: Buffer.from(framed, 'utf8') };
+  parts.push(PKT_FLUSH);
+  return { status: 200, body: Buffer.concat(parts) };
 }
 
 async function handleGit(req: IncomingMessage, res: ServerResponse, url: ReqUrl): Promise<void> {
